@@ -1,40 +1,27 @@
 import argparse
 from .server import Server
-from . import DEFAULT_CONTROL_SOCK_PATH, DEFAULT_DATA_SOCK_PATH
-
+from . import DEFAULT_SOCK_PATH
 
 parser = argparse.ArgumentParser(description="ulog server.")
 
 parser.add_argument(
-    '-c',
-    '--control-sock',
+    '-s',
+    '--socket-file',
     type=str,
-    default=DEFAULT_CONTROL_SOCK_PATH,
-    help=f"Unix sock path for control messages. Default: {DEFAULT_CONTROL_SOCK_PATH}",
-)
-
-parser.add_argument(
-    '-d',
-    '--data-sock',
-    type=str,
-    default=DEFAULT_DATA_SOCK_PATH,
-    help=f"Unix sock path for data messages. Default: {DEFAULT_CONTROL_SOCK_PATH}",
+    default=DEFAULT_SOCK_PATH,
+    help=f"Path of Unix socket the server binds to. Default: {DEFAULT_SOCK_PATH}",
 )
 
 parser.add_argument(
     '-l',
-    '--server-log-dir',
+    '--server-log-path',
     type=str,
     default=None,
-    help="""Directory for the (optional) log file of the ulog server itself.""",
+    help="""Path for the (optional) log file of the ulog server itself.""",
 )
 
 args = parser.parse_args()
 
-server = Server(
-    control_sock_path = args.control_sock,
-    data_sock_path = args.data_sock,
-    log_dir=args.server_log_dir
-)
+server = Server(sock_path=args.socket_file, log_path=args.server_log_path)
 server.connect_shutdown_handler()
 server.run()
