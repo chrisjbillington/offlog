@@ -6,8 +6,9 @@ from datetime import datetime
 import traceback
 import select
 import builtins
+import io
 
-BUFSIZE = 4096
+
 DEFAULT_SOCK_PATH = '/tmp/ulog.sock'
 DEFAULT_TIMEOUT = 5000  # ms
 
@@ -19,9 +20,13 @@ _level_names = {
     DEBUG: 'DEBUG',
 }
 
+_BUFSIZE = 4096
+_FILE_OK = b"OK" # redefined to avoid circular import
+
 
 def _make_exception(response):
-    # Generate an exception object from a response from the server
+    # Generate an exception object from a response from the server. Or return None if no
+    # response
     try:
         exc_class_name, message = response.decode('utf8').split(': ', 1)
         exc_class = getattr(builtins, exc_class_name, ValueError)
@@ -40,76 +45,75 @@ class ProxyFile:
         self,
         filepath,
         sock_path=DEFAULT_SOCK_PATH,
-        connect_timeout=DEFAULT_TIMEOUT,
+        timeout=DEFAULT_TIMEOUT,
     ):
         self.sock_path = sock_path
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.setblocking(0)
         self.poller = select.poll()
         self.poller.register(self.sock, select.POLLIN)
-        self._open(filepath, timeout=connect_timeout)
+        self._recv_buf = io.BytesIO()
+        self._connect()
+        self._open(filepath, timeout=timeout)
 
-    def _recvall(self, timeout):
-        # recv until EOF
-        chunks = []
+    def _send(self, data, return_unsent=True):
+        # Send as much as we can without blocking. If would block, either return unsent
+        # data if `return_unsent` or raise BlockingIOError. If BrokenPipeError, check if
+        # the server sent us an error and raise it if so.
+        while data:
+            try:
+                sent = self.sock.send(data)
+                data = data[sent:]
+            except BlockingIOError:
+                if return_unsent:
+                    return data
+                raise
+            except BrokenPipeError:
+                # Check if the server responded with an error saying why it booted us:
+                response = self._recv_msg(timeout=0)
+                if response:
+                    raise _make_exception(response) from None
+                raise
+
+    def _recv_msg(self, timeout):
+        # recv until null byte
         while self.poller.poll(timeout):
-            chunk = self.sock.recv(BUFSIZE)
-            if not chunk:
-                self.close()
-                return b''.join(chunks)
-        raise TimeoutError("server did not complete response")
+            data = self.sock.recv(_BUFSIZE)
+            if not data:
+                self._recv_buf = io.BytesIO()
+                raise EOFError("Server unexpectedly closed connection")
+            msg, null, extradata = data.partition(b'\0')
+            self._recv_buf.write(msg)
+            if null:
+                msg = self._recv_buf.getvalue()
+                self._recv_buf = io.BytesIO()
+                self._recv_buf.write(extradata)
+                return msg
+        self._recv_buf = io.BytesIO()
+        raise TimeoutError("No response from server")
 
-    def _open(self, filepath, timeout):
+    def _connect(self):
         try:
             self.sock.connect(self.sock_path)
         except FileNotFoundError:
             emsg = f"server socket {self.sock_path} not found"
             raise FileNotFoundError(emsg) from None
 
-        # os.path.abspath deals strangely with null bytes, so check for them after
-        # encoding but before calling abspath:
+    def _open(self, filepath, timeout):
         filepath = os.fsencode(filepath)
         if b'\0' in filepath:
             raise ValueError("embedded null byte in filepath")
-        filepath = os.path.abspath(filepath)
-
-        try:
-            self.sock.sendall(filepath + b'\0')
-        except BrokenPipeError:
-            response = self._recvall(timeout=0)
-            if response:
-                raise _make_exception(response) from None
-            else:
-                raise
-
-        if not self.poller.poll(timeout):
-            raise TimeoutError("no response from server")
-
-        response = self.sock.recv(BUFSIZE)
-        if not response:
-            self.close()
-            raise EOFError("Server unexpectedly closed connection")
-
-        # \0 means success. It's only one byte so we know there's no more data to read.
-        if response != b'\0':
-            try:
-                # Maybe more data
-                response += self._recvall(timeout)
-            except ConnectionResetError:
-                # Maybe not
-                pass
-            self.close()
+        self._send(os.path.abspath(filepath) + b'\0', return_unsent=False)
+        response = self._recv_msg(timeout)
+        if response != _FILE_OK:
             raise _make_exception(response)
 
     def write(self, msg):
-        msg = msg.encode('utf8')
-        while msg:
-            try:
-                written = self.sock.send(msg)
-                msg = msg[written:]
-            except BlockingIOError:
-                # TODO: make config that optionally blocks, drops or buffers?
-                raise
+        data = msg.encode('utf8')
+        unsent = self._send(data, return_unsent=True)
+        if unsent:
+            # TODO: make config to optionally block, drop, or buffer?
+            raise BlockingIOError
 
     def close(self):
         self.sock.close()

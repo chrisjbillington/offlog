@@ -6,15 +6,24 @@ import select
 import traceback
 import signal
 import weakref
+import io
 
 from . import DEFAULT_SOCK_PATH, Logger
 
 BUFSIZE = 4096
 PATH_MAX = os.pathconf('/', 'PC_PATH_MAX')
 
-ERR_PATH_TOO_LONG = b"error: given path longer than PATH_MAX"
-ERR_RELPATH = b"error: not an absolute filepath"
-OK = b'\0'
+# Possible messages to the client. Other messages are possible, if we catch an exception
+# opening or writing to a file and return it to the client.
+ERR_PATH_TOO_LONG = b"ValueError: path longer than PATH_MAX"
+ERR_NABSPATH = b"ValueError: not an absolute path"
+ERR_SHUTDOWN = b"OSError: ulog server exited"
+FILE_OK = b"OK"
+
+# Possible states a client session might be in after receiving data from it:
+CONNECTION_ACTIVE = 0
+CLIENT_CLOSED_CONNECTION = 1
+SERVER_TO_CLOSE_CONNECTION = 2
 
 logger = None
 
@@ -51,19 +60,8 @@ class FileHandler:
         )
 
     def write(self, msg):
-        if self.file is not None:
-            try:
-                self.file.write(msg)
-                self.file.flush()
-            except (OSError, IOError):
-                logger.warning(
-                    "Failed to write to %s:\n%s",
-                    self.filepath,
-                    _format_exc(),
-                )
-                # Don't keep trying to write
-                self.file.close()
-                self.file = None
+        self.file.write(msg)
+        self.file.flush()
 
     def client_done(self, client_id):
         if client_id in self.clients:
@@ -83,6 +81,100 @@ class FileHandler:
             self.file.close()
             self.file = None
         logger.info("Closed %s", self.filepath)
+
+
+class Session:
+    """Class representing a connected client"""
+
+    _next_client_id = 0
+
+    def __init__(self, sock):
+        self.id = self.__class__._next_client_id
+        self.__class__._next_client_id += 1
+        self.sock = sock
+        self.sock.setblocking(0)
+        self.filehandler = None
+        self._recv_buf = io.BytesIO()
+
+    def close(self):
+        if self.filehandler is not None:
+            self.filehandler.client_done(self.id)
+            self.filehandler = None
+        self.sock.close()
+
+    def do_send(self, msg):
+        # Send null-terminated message to the client without blocking, return None on
+        # sucess or disconnect reason on failure.
+        try:
+            self.sock.sendall(msg + b'\0')
+        except BlockingIOError:
+            logger.warning('Client %d sock not writeable', self.id)
+            return SERVER_TO_CLOSE_CONNECTION
+        except BrokenPipeError:
+            return CLIENT_CLOSED_CONNECTION
+
+    def do_recv(self):
+        # Read data from the client
+        try:
+            data = self.sock.recv(BUFSIZE)
+        except ConnectionResetError:
+            return CLIENT_CLOSED_CONNECTION
+        if not data:
+            return CLIENT_CLOSED_CONNECTION
+
+        # If we already have an open file, write the data:
+        if self.filehandler is not None:
+            try:
+                self.filehandler.write(data)
+            except OSError:
+                emsg = _format_exc()
+                logger.warning(
+                    "Failed to write to %s:\n%s", self.filehandler.filepath, emsg
+                )
+                return self.do_send(emsg.encode('utf8')) or SERVER_TO_CLOSE_CONNECTION
+            return CONNECTION_ACTIVE
+
+        # Otherwise we're reading a null-terminated filepath from the client:
+        msg, null, extradata = data.partition(b'\0')
+
+        # Add to any previously-received data:
+        self._recv_buf.write(msg)
+
+        # Check if we've received too much data:
+        if self._recv_buf.getbuffer().nbytes > PATH_MAX:
+            logger.warning('Client %d error, path too long', self.id)
+            return self.do_send(ERR_PATH_TOO_LONG) or SERVER_TO_CLOSE_CONNECTION
+
+        # If not the full filepath, wait for more data:
+        if not null:
+            return CONNECTION_ACTIVE
+
+        # We are done reading a filepath
+        path = os.fsdecode(self._recv_buf.getvalue())
+        self._recv_buf.seek(0)
+        self._recv_buf.truncate()
+
+        # Check it's an absolute path:
+        if not path.startswith('/'):
+            logger.warning('Client %d error, not an absolute path: %s', self.id, path)
+            return self.do_send(ERR_NABSPATH) or SERVER_TO_CLOSE_CONNECTION
+
+        # Try opening the file:
+        try:
+            self.filehandler = FileHandler.instance(path)
+        except OSError:
+            emsg = _format_exc()
+            logger.warning('Client %d access denied for %s:\n%s', self.id, path, emsg)
+            return self.do_send(emsg.encode('utf8')) or SERVER_TO_CLOSE_CONNECTION
+
+        logger.info('Client %d access confirmed for %s', self.id, path)
+        self.filehandler.new_client(self.id)
+        if extradata:
+            # Client sent through some data to be written without waiting for a
+            # response. That's fine, write the data:
+            self.filehandler.write(extradata)
+
+        return self.do_send(FILE_OK) or CONNECTION_ACTIVE
 
 
 class Server:
@@ -105,129 +197,33 @@ class Server:
         # A pipe we can use to signal shutdown from a signal handler
         self.selfpipe_reader, self.selfpipe_writer = os.pipe()
 
-        self.next_client_id = 0
-        # mapping of fds to client socks:
-        self.client_socks = {}
-        # Mapping of client socks to client ids
-        self.client_ids = {}
-        # Mapping of client socks to handlers
-        self.handlers = {}
-
-        # Storage for partially received data and size counts
-        self.recv_bufs = {}
-        self.recv_bufs_nbytes = {}
-
         self.poller = select.poll()
         self.poller.register(self.listen_sock, select.POLLIN)
         self.poller.register(self.selfpipe_reader, select.POLLIN)
+
+        # Mapping of socket file descriptors to Session objects for connected clients
+        self.clients = {}
 
         logger.info("This is ulog server")
         logger.info("Listening on socket %s", self.sock_path)
 
     def handle_client_connect(self):
         client_sock, _ = self.listen_sock.accept()
-        client_sock.setblocking(0)
-        self.client_ids[client_sock] = self.next_client_id
-        self.client_socks[client_sock.fileno()] = client_sock
-        self.poller.register(client_sock, select.POLLIN)
-        logger.info("Client %d connected", self.next_client_id)
-        self.next_client_id += 1
+        client = Session(client_sock)
+        self.clients[client_sock.fileno()] = client
+        self.poller.register(client.sock, select.POLLIN)
+        logger.info("Client %d connected", client.id)
 
-    def handle_client_disconnect(self, client_sock, initiated_by_us=False):
-        client_id = self.client_ids[client_sock]
-        if initiated_by_us:
-            logger.info("Closing connection with client %d", client_id)
+    def handle_client_disconnect(self, client, reason):
+        if reason == SERVER_TO_CLOSE_CONNECTION:
+            logger.info("Closing connection with client %d", client.id)
+        elif reason == CLIENT_CLOSED_CONNECTION:
+            logger.info("Client %d disconnected", client.id)
         else:
-            logger.info("Client %d disconnected", client_id)
-        if client_sock in self.handlers:
-            self.handlers[client_sock].client_done(client_id)
-            del self.handlers[client_sock]
-        if client_sock in self.recv_bufs:
-            del self.recv_bufs[client_sock]
-            del self.recv_bufs_nbytes[client_sock]
-        del self.client_ids[client_sock]
-        del self.client_socks[client_sock.fileno()]
-        self.poller.unregister(client_sock)
-        client_sock.close()
-
-    def process_set_filepath(self, client_id, sock, data):
-        msg, null, extradata = data.partition(b'\0')
-
-        if not null:
-            # We haven't received the full message. Store for later
-            if sock not in self.recv_bufs:
-                self.recv_bufs[sock] = []
-                self.recv_bufs_nbytes[sock] = 0
-            self.recv_bufs[sock].append(msg)
-            self.recv_bufs_nbytes[sock] += len(msg)
-            if self.recv_bufs_nbytes[sock] > PATH_MAX:
-                logger.warning('Client %d error, path too long', client_id)
-                return ERR_PATH_TOO_LONG
-            return
-
-        # Include any previously read data:
-        if sock in self.recv_bufs:
-            msg = b''.join(self.recv_bufs[sock]) + msg
-            del self.recv_bufs[sock]
-            del self.recv_bufs_nbytes[sock]
-
-        filepath = os.fsdecode(msg)
-        if len(filepath) > PATH_MAX:
-            logger.warning('Client %d error, path too long', client_id)
-            return ERR_PATH_TOO_LONG
-        if not filepath.startswith('/'):
-            logger.warning('Client %d error, not absolute path', client_id)
-            return ERR_RELPATH
-        try:
-            handler = FileHandler.instance(filepath)
-        except (OSError, IOError):
-            emsg = _format_exc()
-            logger.warning(
-                'Client %d access denied for %s: \n    %s', client_id, filepath, emsg
-            )
-            return emsg.encode('utf8')
-
-        self.handlers[sock] = handler
-        handler.new_client(client_id)
-        if extradata:
-            # Client sent through some data to be written without waiting for a
-            # response. That's fine, write the data:
-            handler.write(extradata)
-
-        logger.info('Client %d access confirmed for %s', client_id, filepath)
-        return OK
-
-    def handle_client_data(self, sock):
-        client_id = self.client_ids[sock]
-
-        # Read data from the client
-        try:
-            data = sock.recv(BUFSIZE)
-        except ConnectionResetError:
-            self.handle_client_disconnect(sock)
-            return
-        if not data:
-            # Client disconnected
-            self.handle_client_disconnect(sock)
-            return
-
-        # If it already has an open file, write the data:
-        handler = self.handlers.get(sock)
-        if handler is not None:
-            handler.write(data)
-        else:
-            # Client hasn't set their filepath yet
-            response = self.process_set_filepath(client_id, sock, data)
-            if response:
-                try:
-                    sock.send(response)
-                    if response != OK:
-                        self.handle_client_disconnect(sock, initiated_by_us=True)
-                except BlockingIOError:
-                    logger.warning('Client %d sock not ready', client_id)
-                    self.handle_client_disconnect(sock, initiated_by_us=True)
-                except BrokenPipeError:
-                    self.handle_client_disconnect(sock)
+            raise ValueError(reason)
+        del self.clients[client.sock.fileno()]
+        self.poller.unregister(client.sock)
+        client.close()
 
     def run(self):
         self.listen_sock.listen()
@@ -243,9 +239,11 @@ class Server:
                     self.shutdown()
                 else:
                     # Data from a client:
-                    self.handle_client_data(self.client_socks[fd])
-
-            if self.listen_sock.fileno() == -1 and not self.client_socks:
+                    client = self.clients[fd]
+                    status = client.do_recv()
+                    if status != CONNECTION_ACTIVE:
+                        self.handle_client_disconnect(client, status)
+            if self.listen_sock.fileno() == -1 and not self.clients:
                 # Finished shutting down
                 logger.info("Exit")
                 break
@@ -263,8 +261,9 @@ class Server:
         # Shutdown sockets for receiving new data. Mainloop will keep running to process
         # remaining data, then exit once there are no more clients with unread data
         # left.
-        for client_sock in self.client_socks.values():
-            client_sock.shutdown(socket.SHUT_RD)
+        for client in self.clients.values():
+            client.do_send(ERR_SHUTDOWN)  # Ignore errors here if we can't send
+            client.sock.shutdown(socket.SHUT_RD)
 
     def connect_shutdown_handler(self):
         """Handle SIGINT and SIGTERM to shutdown gracefully"""
