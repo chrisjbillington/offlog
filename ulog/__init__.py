@@ -50,8 +50,8 @@ class ProxyFile:
         self.sock_path = sock_path
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.setblocking(0)
-        self.poller = select.poll()
-        self.poller.register(self.sock, select.POLLIN)
+        self.poller = select.epoll()
+        self.poller.register(self.sock, select.EPOLLIN)
         self._recv_buf = io.BytesIO()
         self._connect()
         self._open(filepath, timeout=timeout)

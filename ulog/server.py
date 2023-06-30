@@ -207,9 +207,9 @@ class Server:
         # A pipe we can use to signal shutdown from a signal handler
         self.selfpipe_reader, self.selfpipe_writer = os.pipe()
 
-        self.poller = select.poll()
-        self.poller.register(self.listen_sock, select.POLLIN)
-        self.poller.register(self.selfpipe_reader, select.POLLIN)
+        self.poller = select.epoll()
+        self.poller.register(self.listen_sock, select.EPOLLIN)
+        self.poller.register(self.selfpipe_reader, select.EPOLLIN)
 
         # Mapping of socket file descriptors to Session objects for connected clients
         self.clients = {}
@@ -218,7 +218,7 @@ class Server:
         client_sock, _ = self.listen_sock.accept()
         client = Session(client_sock)
         self.clients[client_sock.fileno()] = client
-        self.poller.register(client.sock, select.POLLIN)
+        self.poller.register(client.sock, select.EPOLLIN)
         logger.info("Client %d connected", client.id)
 
     def handle_client_disconnect(self, client, reason):
@@ -229,7 +229,6 @@ class Server:
         else:
             raise ValueError(reason)
         del self.clients[client.sock.fileno()]
-        self.poller.unregister(client.sock)
         client.close()
 
     def run(self):
@@ -265,10 +264,8 @@ class Server:
     def shutdown(self):
         os.close(self.selfpipe_reader)
         os.close(self.selfpipe_writer)
-        self.poller.unregister(self.selfpipe_reader)
 
         # Stop accepting new connections
-        self.poller.unregister(self.listen_sock)
         self.listen_sock.close()
         self.sock_path.unlink(missing_ok=True)
 
