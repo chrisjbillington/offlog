@@ -7,6 +7,8 @@ import traceback
 import signal
 import weakref
 import io
+import ctypes
+import ctypes.util
 
 from . import DEFAULT_SOCK_PATH, Logger
 
@@ -29,9 +31,18 @@ logger = None
 
 
 def _format_exc():
-    """Format just the last line of the current exception, not the whole traceback"""
+    # Format just the last line of the current exception, not the whole traceback
     exc_type, exc_value, _ = sys.exc_info()
     return traceback.format_exception_only(exc_type, exc_value)[0].strip()
+
+
+def _systemd_notify():
+    # Notify systemd that we've started up
+    libname = ctypes.util.find_library('systemd')
+    if libname is None:
+        raise OSError("Could not find libsystemd")
+    libsystemd = ctypes.CDLL(libname)
+    libsystemd.sd_notify(0, b'READY=1')
 
 
 class FileHandler:
@@ -179,17 +190,16 @@ class Session:
 
 class Server:
     def __init__(
-        self,
-        sock_path=DEFAULT_SOCK_PATH,
-        log_path=None,
+        self, sock_path=DEFAULT_SOCK_PATH, log_path=None, systemd_notify=False
     ):
         # Create a logger for the server itself
         global logger
         logger = Logger(name='ulog', filepath=log_path, local_file=True)
 
+        self.systemd_notify = systemd_notify
+
         self.sock_path = Path(sock_path)
         self.sock_path.unlink(missing_ok=True)
-
         self.listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listen_sock.setblocking(0)
         self.listen_sock.bind(str(self.sock_path))
@@ -203,9 +213,6 @@ class Server:
 
         # Mapping of socket file descriptors to Session objects for connected clients
         self.clients = {}
-
-        logger.info("This is ulog server")
-        logger.info("Listening on socket %s", self.sock_path)
 
     def handle_client_connect(self):
         client_sock, _ = self.listen_sock.accept()
@@ -227,6 +234,13 @@ class Server:
 
     def run(self):
         self.listen_sock.listen()
+
+        logger.info("This is ulog server")
+        logger.info("Listening on socket %s", self.sock_path)
+
+        if self.systemd_notify:
+            _systemd_notify()
+
         while True:
             events = self.poller.poll()
             for fd, _ in events:
