@@ -21,6 +21,7 @@ ERR_PATH_TOO_LONG = b"ValueError: path longer than PATH_MAX"
 ERR_NABSPATH = b"ValueError: not an absolute path"
 ERR_SHUTDOWN = b"OSError: ulog server exited"
 FILE_OK = b"OK"
+GOODBYE = b"BYE"
 
 # Possible states a client session might be in after receiving data from it:
 CONNECTION_ACTIVE = 0
@@ -106,12 +107,19 @@ class Session:
         self.sock.setblocking(0)
         self.filehandler = None
         self._recv_buf = io.BytesIO()
+        self._shutting_down = False
 
     def close(self):
         if self.filehandler is not None:
             self.filehandler.client_done(self.id)
             self.filehandler = None
         self.sock.close()
+
+    def do_shutdown(self):
+        status = self.do_send(ERR_SHUTDOWN)
+        self.sock.shutdown(socket.SHUT_RD)
+        self._shutting_down = True
+        return status or CONNECTION_ACTIVE  # will close once we've read remaining data
 
     def do_send(self, msg):
         # Send null-terminated message to the client without blocking, return None on
@@ -121,7 +129,7 @@ class Session:
         except BlockingIOError:
             logger.warning('Client %d sock not writeable', self.id)
             return SERVER_TO_CLOSE_CONNECTION
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             return CLIENT_CLOSED_CONNECTION
 
     def do_recv(self):
@@ -131,7 +139,12 @@ class Session:
         except ConnectionResetError:
             return CLIENT_CLOSED_CONNECTION
         if not data:
-            return CLIENT_CLOSED_CONNECTION
+            if self._shutting_down:
+                # Finished reading remaining data from client during server shutdown
+                return SERVER_TO_CLOSE_CONNECTION
+            else:
+                # Client-initiated shutdown
+                return self.do_send(GOODBYE) or CLIENT_CLOSED_CONNECTION
 
         # If we already have an open file, write the data:
         if self.filehandler is not None:
@@ -273,8 +286,9 @@ class Server:
         # remaining data, then exit once there are no more clients with unread data
         # left.
         for client in self.clients.values():
-            client.do_send(ERR_SHUTDOWN)  # Ignore errors here if we can't send
-            client.sock.shutdown(socket.SHUT_RD)
+            status = client.do_shutdown()
+            if status != CONNECTION_ACTIVE:
+                self.handle_client_disconnect(client, status)
 
     def connect_shutdown_handler(self):
         """Handle SIGINT and SIGTERM to shutdown gracefully"""

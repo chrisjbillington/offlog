@@ -22,6 +22,7 @@ _level_names = {
 
 _BUFSIZE = 4096
 _FILE_OK = b"OK" # redefined to avoid circular import
+_GOODBYE = b"BYE"
 
 
 def _make_exception(response):
@@ -47,6 +48,7 @@ class ProxyFile:
         sock_path=DEFAULT_SOCK_PATH,
         timeout=DEFAULT_TIMEOUT,
     ):
+        self.timeout = timeout
         self.sock_path = sock_path
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.setblocking(0)
@@ -54,7 +56,7 @@ class ProxyFile:
         self.poller.register(self.sock, select.EPOLLIN)
         self._recv_buf = io.BytesIO()
         self._connect()
-        self._open(filepath, timeout=timeout)
+        self._open(filepath)
 
     def _send(self, data, return_unsent=True):
         # Send as much as we can without blocking. If would block, either return unsent
@@ -75,21 +77,21 @@ class ProxyFile:
                     raise _make_exception(response) from None
                 raise
 
-    def _recv_msg(self, timeout):
-        # recv until null byte
+    def _recv_msg(self, timeout=None):
+        # recv until null byte. If timeout or EOF, raise but leave data read so far in
+        # self._recv_buf.
+        if timeout is None:
+            timeout = self.timeout
         while self.poller.poll(timeout):
             data = self.sock.recv(_BUFSIZE)
-            if not data:
-                self._recv_buf = io.BytesIO()
-                raise EOFError("Server unexpectedly closed connection")
             msg, null, extradata = data.partition(b'\0')
             self._recv_buf.write(msg)
+            if not data:
+                raise EOFError
             if null:
                 msg = self._recv_buf.getvalue()
-                self._recv_buf = io.BytesIO()
-                self._recv_buf.write(extradata)
+                self._recv_buf = io.BytesIO(extradata)
                 return msg
-        self._recv_buf = io.BytesIO()
         raise TimeoutError("No response from server")
 
     def _connect(self):
@@ -99,12 +101,12 @@ class ProxyFile:
             emsg = f"server socket {self.sock_path} not found"
             raise FileNotFoundError(emsg) from None
 
-    def _open(self, filepath, timeout):
+    def _open(self, filepath):
         filepath = os.fsencode(filepath)
         if b'\0' in filepath:
             raise ValueError("embedded null byte in filepath")
         self._send(os.path.abspath(filepath) + b'\0', return_unsent=False)
-        response = self._recv_msg(timeout)
+        response = self._recv_msg(self.timeout)
         if response != _FILE_OK:
             raise _make_exception(response)
 
@@ -116,7 +118,14 @@ class ProxyFile:
             raise BlockingIOError
 
     def close(self):
-        self.sock.close()
+        try:
+            # TODO: send all unsent data
+            self.sock.shutdown(socket.SHUT_WR)
+            response = self._recv_msg(self.timeout)
+            if response != _GOODBYE:
+                raise _make_exception(response)
+        finally:
+            self.sock.close()
 
 
 class Logger:
