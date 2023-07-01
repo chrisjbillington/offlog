@@ -175,8 +175,7 @@ class Session:
 
         # We are done reading a filepath
         path = os.fsdecode(self._recv_buf.getvalue())
-        self._recv_buf.seek(0)
-        self._recv_buf.truncate()
+        self._recv_buf = io.BytesIO()
 
         # Check it's an absolute path:
         if not path.startswith('/'):
