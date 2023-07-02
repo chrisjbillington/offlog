@@ -24,11 +24,11 @@ class Logger:
         stdout_level=INFO,
         stderr_level=WARNING,
         local_file=False,
-        ulog_socket_path=DEFAULT_SOCK_PATH,
-        ulog_timeout=DEFAULT_TIMEOUT
+        offlog_socket_path=DEFAULT_SOCK_PATH,
+        offlog_timeout=DEFAULT_TIMEOUT
     ):
         """Logging object to log to file, stdout and stderr, with optional proxying of
-        file writes via a ulog server.
+        file writes via a offlog server.
 
         Records with level `file_level` and above will be written to the given file.
         Records with level `stdout_level` and above, up to but not including
@@ -38,7 +38,7 @@ class Logger:
         stream. `filepath=None` will also disable file logging.
 
         if `local_file` is True, then an ordinary file will be opened for writing.
-        Otherwise `ulog_socket_path` is used to connect to a running ulog server, which
+        Otherwise `offlog_socket_path` is used to connect to a running offlog server, which
         will open the file for us, writes will be proxied through it.
 
         UTF-8 encoding is assumed throughout."""
@@ -47,8 +47,8 @@ class Logger:
         self.file_level = file_level
         self.stdout_level = stdout_level
         self.stderr_level = stderr_level
-        self.ulog_socket_path = ulog_socket_path
-        self.ulog_timeout = ulog_timeout
+        self.offlog_socket_path = offlog_socket_path
+        self.offlog_timeout = offlog_timeout
         self.local_file = local_file
         self.minlevel = min(
             [l for l in [file_level, stdout_level, stderr_level] if l is not None]
@@ -62,8 +62,8 @@ class Logger:
             else:
                 return ProxyFile(
                     self.filepath,
-                    sock_path=self.ulog_socket_path,
-                    timeout=self.ulog_timeout,
+                    sock_path=self.offlog_socket_path,
+                    timeout=self.offlog_timeout,
                 )
 
     def close(self):

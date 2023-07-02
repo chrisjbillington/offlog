@@ -76,7 +76,7 @@ class _ByteQueue:
 
 
 class ProxyFile:
-    """Object to proxy appending file writes via a running ulog server"""
+    """Object to proxy appending file writes via a running offlog server"""
 
     def __init__(
         self,

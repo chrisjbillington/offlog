@@ -1,4 +1,4 @@
-from ulog import Logger
+from offlog import Logger
 import time
 
 logger = Logger('foo', 'test.log', stdout_level=None, stderr_level=None)

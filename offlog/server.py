@@ -19,7 +19,7 @@ PATH_MAX = os.pathconf('/', 'PC_PATH_MAX')
 # opening or writing to a file and return it to the client.
 ERR_PATH_TOO_LONG = b"ValueError: path longer than PATH_MAX"
 ERR_NABSPATH = b"ValueError: not an absolute path"
-ERR_SHUTDOWN = b"OSError: ulog server exited"
+ERR_SHUTDOWN = b"OSError: offlog server exited"
 FILE_OK = b"OK"
 GOODBYE = b"BYE"
 
@@ -206,7 +206,7 @@ class Server:
     ):
         # Create a logger for the server itself
         global logger
-        logger = Logger(name='ulog', filepath=log_path, local_file=True)
+        logger = Logger(name='offlog', filepath=log_path, local_file=True)
 
         self.systemd_notify = systemd_notify
 
@@ -246,7 +246,7 @@ class Server:
     def run(self):
         self.listen_sock.listen()
 
-        logger.info("This is ulog server")
+        logger.info("This is offlog server")
         logger.info("Listening on socket %s", self.sock_path)
 
         if self.systemd_notify:
@@ -260,7 +260,7 @@ class Server:
                 elif fd == self.selfpipe_reader:
                     # Shutting down. We will process remaining data before exiting the
                     # mainloop.
-                    logger.info("Interrupted, shutting down")
+                    logger.info("Received signal, shutting down")
                     self.shutdown()
                 else:
                     # Data from a client:

@@ -1,4 +1,4 @@
-DEFAULT_SOCK_PATH = '/tmp/ulog.sock'
+DEFAULT_SOCK_PATH = '/tmp/offlog.sock'
 DEFAULT_TIMEOUT = 5000  # ms
 
 from .client import ProxyFile

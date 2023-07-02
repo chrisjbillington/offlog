@@ -4,7 +4,7 @@ from . import DEFAULT_SOCK_PATH
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ulog server.")
+    parser = argparse.ArgumentParser(description="offlog file-append service")
 
     parser.add_argument(
         '-n',
@@ -26,7 +26,7 @@ def main():
         '--logfile',
         type=str,
         default=None,
-        help="""Path of the (optional) log file for the ulog server itself.""",
+        help="""Path of the (optional) log file for the offlog server itself.""",
     )
 
     args = parser.parse_args()
