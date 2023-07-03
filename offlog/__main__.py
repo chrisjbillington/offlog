@@ -4,7 +4,10 @@ from . import DEFAULT_SOCK_PATH
 
 
 def main():
-    parser = argparse.ArgumentParser(description="offlog file-append service")
+    parser = argparse.ArgumentParser(
+        prog="python -m offlog",
+        description="offlog file-append service",
+    )
 
     parser.add_argument(
         '-n',

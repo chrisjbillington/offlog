@@ -102,6 +102,9 @@ class ProxyFile:
             self.sock.close()
             emsg = f"server socket {self.sock_path} not found"
             raise FileNotFoundError(emsg) from None
+        except PermissionError:
+            self.sock.close()
+            raise
 
     def _recv_msg(self, timeout=None):
         # recv until null byte. If timeout or EOF, raise but leave data read so far in
@@ -125,7 +128,7 @@ class ProxyFile:
                 self._recv_buf.write(extradata)
                 return msg
         self.sock.close()
-        raise TimeoutError("No response from server")
+        raise TimeoutError("no response from server")
 
     def _open(self, filepath):
         filepath = os.fsencode(filepath)
@@ -201,7 +204,7 @@ class ProxyFile:
                     self._retry_queued()
                 else:
                     raise TimeoutError(
-                    "Timed out flushing unsent data on close(). "
+                    "timed out flushing unsent data on close(). "
                     + f"{len(self._sendqueue)} bytes not sent."
                 )
             self.sock.shutdown(socket.SHUT_WR)

@@ -37,11 +37,14 @@ class Logger:
         written to stderr. Any of these can be set to None to disaable writing to that
         stream. `filepath=None` will also disable file logging.
 
-        if `local_file` is True, then an ordinary file will be opened for writing.
-        Otherwise `offlog_socket_path` is used to connect to a running offlog server, which
-        will open the file for us, writes will be proxied through it.
+        if `local_file` is `True`, then an ordinary file will be opened for writing. Otherwise
+        `offlog_socket_path` is used to connect to a running offlog server, which will open the
+        file for us, writes will be proxied through it. Any blocking operations communicating
+        with the server (such as the initial file open, and flushing data at shutdown) will be
+        subject to a communications timeout of `offlog_timeout` in milliseconds, default 5000.
 
         UTF-8 encoding is assumed throughout."""
+
         self.name = name
         self.filepath = filepath
         self.file_level = file_level
@@ -67,6 +70,7 @@ class Logger:
                 )
 
     def close(self):
+        """Close the file. Possibly blocking. Idempotent."""
         if getattr(self, 'file', None) is not None:
             self.file.close()
 
