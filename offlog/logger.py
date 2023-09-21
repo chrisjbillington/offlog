@@ -76,7 +76,10 @@ class Logger:
 
     def format(self, level, msg, *args, exc_info=None):
         t = datetime.now().isoformat(sep=' ')[:-3]
-        msg = f"[{t} {self.name} {_level_names[level]}] {msg}\n"
+        if self.name is not None:
+            msg = f"[{t} {self.name} {_level_names[level]}] {msg}\n"
+        else:
+            msg = f"[{t} {_level_names[level]}] {msg}\n"
         if args:
             msg %= args
         if exc_info:
