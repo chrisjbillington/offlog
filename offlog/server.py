@@ -5,7 +5,6 @@ import socket
 import select
 import traceback
 import signal
-import weakref
 import io
 import ctypes
 import ctypes.util
@@ -47,52 +46,21 @@ def _systemd_notify():
 
 
 class FileHandler:
-    _instances = weakref.WeakValueDictionary()
-
-    @classmethod
-    def instance(cls, filepath):
-        instance = cls._instances.get(filepath)
-        if instance is None:
-            instance = cls(filepath)
-            cls._instances[filepath] = instance
-        return instance
-
-    def __init__(self, filepath):
+    def __init__(self, filepath, client_id):
         self.filepath = filepath
-        self.clients = set()
+        self.client_id = client_id
         self.file = open(self.filepath, 'ab')
-
-    def new_client(self, client_id):
-        self.clients.add(client_id)
-        logger.info(
-            "New client %d (total: %d) for %s",
-            client_id,
-            len(self.clients),
-            self.filepath,
-        )
+        logger.info("Client %d opened %s", self.client_id, self.filepath)
 
     def write(self, msg):
         self.file.write(msg)
         self.file.flush()
 
-    def client_done(self, client_id):
-        if client_id in self.clients:
-            self.clients.remove(client_id)
-            logger.info(
-                "Client %d done (remaining: %d) with %s",
-                client_id,
-                len(self.clients),
-                self.filepath,
-            )
-            if not self.clients:
-                self.close()
-
     def close(self):
-        del self._instances[self.filepath]
         if self.file is not None:
             self.file.close()
+            logger.info("Client %d closed %s", self.client_id, self.filepath)
             self.file = None
-        logger.info("Closed %s", self.filepath)
 
 
 class Session:
@@ -111,7 +79,7 @@ class Session:
 
     def close(self):
         if self.filehandler is not None:
-            self.filehandler.client_done(self.id)
+            self.filehandler.close()
             self.filehandler = None
         self.sock.close()
 
@@ -184,14 +152,12 @@ class Session:
 
         # Try opening the file:
         try:
-            self.filehandler = FileHandler.instance(path)
+            self.filehandler = FileHandler(path, self.id)
         except OSError:
             emsg = _format_exc()
             logger.warning('Client %d access denied for %s:\n%s', self.id, path, emsg)
             return self.do_send(emsg.encode('utf8')) or SERVER_TO_CLOSE_CONNECTION
 
-        logger.info('Client %d access confirmed for %s', self.id, path)
-        self.filehandler.new_client(self.id)
         if extradata:
             # Client sent through some data to be written without waiting for a
             # response. That's fine, write the data:
