@@ -1,9 +1,11 @@
 import sys
+import os
 from datetime import datetime
+from time import monotonic
 import traceback
 from logging import DEBUG, INFO, WARNING, ERROR, CRITICAL
 
-from . import DEFAULT_SOCK_PATH, DEFAULT_TIMEOUT
+from . import DEFAULT_SOCK_PATH, DEFAULT_TIMEOUT, DEFAULT_ROLL_CHECK_INTERVAL
 from .client import ProxyFile
 
 _level_names = {
@@ -25,7 +27,8 @@ class Logger:
         stderr_level=WARNING,
         local_file=False,
         offlog_socket_path=DEFAULT_SOCK_PATH,
-        offlog_timeout=DEFAULT_TIMEOUT
+        offlog_timeout=DEFAULT_TIMEOUT,
+        min_roll_check_interval=DEFAULT_ROLL_CHECK_INTERVAL,
     ):
         """Logging object to log to file, stdout and stderr, with optional proxying of
         file writes via a offlog server.
@@ -43,6 +46,11 @@ class Logger:
         with the server (such as the initial file open, and flushing data at shutdown) will be
         subject to a communications timeout of `offlog_timeout` in milliseconds, default 5000.
 
+        `min_roll_check_interval` is the minimum time in milliseconds in between checks
+        for whether the file has vanished off disk, such as if the log file has been
+        rolled by an external log rotating program. If this is detected, the file is
+        closed and reopened.
+
         UTF-8 encoding is assumed throughout."""
 
         self.name = name
@@ -57,8 +65,10 @@ class Logger:
             [l for l in [file_level, stdout_level, stderr_level] if l is not None]
         )
         self.file = self._open()
+        self._last_roll_check = monotonic()
+        self.min_roll_check_interval = min_roll_check_interval
 
-    def _open(self):
+    def _open(self, block=True):
         if self.file_level is not None and self.filepath is not None:
             if self.local_file:
                 return open(self.filepath, 'a', encoding='utf8')
@@ -67,12 +77,52 @@ class Logger:
                     self.filepath,
                     sock_path=self.offlog_socket_path,
                     timeout=self.offlog_timeout,
+                    block_open=block
                 )
 
-    def close(self):
-        """Close the file. Possibly blocking. Idempotent."""
+    def _roll_check(self):
+        # Check if the file has vanished on disk and if so, close and reopen it. This
+        # will block if the unix socket to the server is full, but will not block
+        # waiting for the server to confirm data was flushed on close, or waiting for
+        # the server to confirm the file was reopened. Thus as long as the server is not
+        # lagging so much that our unix socket buffer is full (which is like, 200kB on
+        # most systems), this should be non-blocking.
+        if self.file is not None:
+            now = monotonic()
+            if 1000 * (now - self._last_roll_check) > self.min_roll_check_interval:
+                self._last_roll_check = now
+                if not os.path.exists(self.filepath):
+                    # Close and reopen, blocking only if the unix socket to send data is
+                    # full - this should not normally happen as it's 200kB large on most
+                    # systems. If there's an error reopening the file, it will be raised
+                    # at next write attempt
+                    self.file.close(block_send=True, block_close=False)
+                    self.file = self._open(block=False)
+
+    def close(self, block_send=True, block_close=True):
+        """Close the file. Possibly blocking. Idempotent.
+
+        For the case of a proxied file, optional arguments are (ignored for local file):
+
+        If block_send=True, block for up to self.offlog_timeout (as configured at file
+        open time) milliseconds sending unsent data to the server, otherwise only send
+        data that can be sent without blocking.
+
+        if block_close=True then wait for a response from the server to confirm all
+        previously-sent data was written, and that the file was closed.
+
+        block_send=True and block_close=False is a reasonable arrangement to prevent the
+        application blocking due to slow file IO on a small amount of data, whilst
+        accepting that it may block if there is so much data that the unix socket's
+        buffer is full. This may be useful if the application is closing and reopening
+        the file for log rolling purposes (in which case you'd like this to be
+        non-blocking unless something is very wrong), wheras at application shutdown you
+        probably want block_send=True, block_close=True"""
         if getattr(self, 'file', None) is not None:
-            self.file.close()
+            if self.local_file:
+                self.file.close()
+            else:
+                self.file.close(block_send=block_send, block_close=block_close)
 
     def format(self, level, msg, *args, exc_info=None):
         t = datetime.now().isoformat(sep=' ')[:-3]
@@ -93,6 +143,7 @@ class Logger:
     def log(self, level, msg, *args, exc_info=False):
         if level < self.minlevel:
             return
+        self._roll_check()
         msg = self.format(level, msg, *args, exc_info=exc_info)
         if self.file is not None and level >= self.file_level:
             self.file.write(msg)

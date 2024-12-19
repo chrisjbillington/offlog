@@ -83,6 +83,7 @@ class ProxyFile:
         filepath,
         sock_path=DEFAULT_SOCK_PATH,
         timeout=DEFAULT_TIMEOUT,
+        block_open=True,
     ):
         self.timeout = timeout
         self.sock_path = sock_path
@@ -93,7 +94,7 @@ class ProxyFile:
         self._recv_buf = io.BytesIO()
         self._sendqueue = _ByteQueue()
         self._connect()
-        self._open(filepath)
+        self._open(filepath, block=block_open)
 
     def _connect(self):
         try:
@@ -130,29 +131,37 @@ class ProxyFile:
         self.sock.close()
         raise TimeoutError("no response from server")
 
-    def _open(self, filepath):
+    def _open(self, filepath, block=True):
         filepath = os.fsencode(filepath)
         if b'\0' in filepath:
             self.sock.close()
             raise ValueError("embedded null byte in filepath")
         self.write(os.path.abspath(filepath) + b'\0')
-        response = self._recv_msg()
-        if response != FILE_OK:
-            self.sock.close()
-            raise _make_exception(response)
+        # Check for errors now if block=True, otherwise error responses will be received
+        # and raised later when client attempts to write
+        if block:
+            self._check_errmsg_received()
+
+    def _check_errmsg_received(self):
+        """Check if the server has sent us an error message and raise it if so"""
+        while self.poller.poll(0):
+            # No possibility of getting a partial message (and therefore TimeoutError)
+            # because all messages the server sends are smaller than PIPE_BUF and
+            # therefore sent atomically
+            msg = self._recv_msg(timeout=0)
+            if msg != FILE_OK: # indicates sucessful file open, ignore.
+                self.sock.close()
+                raise _make_exception(msg) from None
 
     def _checksend(self, data):
-        """Send data and return number of bytes sent. On BrokenPipeError, check if the
-        server sent us an error and raise it if so."""
+        """Send data and return number of bytes sent. If the server has sent us an error
+        message, raise it."""
+        self._check_errmsg_received()
         try:
             return self.sock.send(data)
         except BrokenPipeError:
-            # Check if the server responded with an error saying why it booted us:
-            response = self._recv_msg(timeout=0)
-            self.sock.close()
-            if response:
-                raise _make_exception(response) from None
-            raise
+            self._check_errmsg_received()
+            raise # reraise if no error was raised by _check_errmsg_received()
         except ConnectionResetError:
             self.sock.close()
             raise
@@ -190,27 +199,45 @@ class ProxyFile:
             # Queue unsent data for later
             self._sendqueue.put(data)
 
-    def close(self):
+    def close(self, block_send=True, block_close=True):
         """Close the socket. Attempt to send all queued unsent data to the server and
-        cleanly close the connection to it, raising exceptions if anything goes wrong"""
+        cleanly close the connection to it, raising exceptions if anything goes wrong.
+        
+        If block_send=True, block for up to self.timeout ms sending unsent data to the
+        server, otherwise only send data that can be sent without blocking.
+
+        if block_close=True then wait for a response from the server to confirm all
+        previously-sent data was written, and that the file was closed.
+
+        block_send=True and block_close=False is a reasonable arrangement to prevent the
+        application blocking due to slow file IO on a small amount of data, whilst
+        accepting that it may block if there is so much data that the unix socket's
+        buffer is full. This may be useful if the application is closing and reopening
+        the file for log rolling purposes (in which case you'd like this to be
+        non-blocking unless something is very wrong), wheras at application shutdown you
+        probably want block_send=True, block_close=True"""
         if self.sock.fileno() == -1:
             return
         try:
             # Attempt to flush unsent data:
             poller = select.epoll()
             poller.register(self.sock, select.EPOLLOUT)
-            while self._sendqueue:
-                if poller.poll(self.timeout):
-                    self._retry_queued()
-                else:
-                    raise TimeoutError(
-                    "timed out flushing unsent data on close(). "
-                    + f"{len(self._sendqueue)} bytes not sent."
-                )
+            if block_send:
+                while self._sendqueue:
+                    if poller.poll(self.timeout):
+                        self._retry_queued()
+                    else:
+                        raise TimeoutError(
+                        "timed out flushing unsent data on close(). "
+                        + f"{len(self._sendqueue)} bytes not sent."
+                    )
+            else:
+                self._retry_queued()
             self.sock.shutdown(socket.SHUT_WR)
-            response = self._recv_msg()
-            if response != GOODBYE:
-                raise _make_exception(response)
+            if block_close:
+                response = self._recv_msg()
+                if response != GOODBYE:
+                    raise _make_exception(response)
         finally:
             self.sock.close()
 
