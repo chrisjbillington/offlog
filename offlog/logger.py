@@ -96,7 +96,7 @@ class Logger:
                     # full - this should not normally happen as it's 200kB large on most
                     # systems. If there's an error reopening the file, it will be raised
                     # at next write attempt
-                    self.file.close(block_send=True, block_close=False)
+                    self.close(block_send=True, block_close=False)
                     self.file = self._open(block=False)
 
     def close(self, block_send=True, block_close=True):
