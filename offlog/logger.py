@@ -1,11 +1,10 @@
 import sys
 import os
 from datetime import datetime
-from time import monotonic
 import traceback
 from logging import DEBUG, INFO, WARNING, ERROR, CRITICAL
 
-from . import DEFAULT_SOCK_PATH, DEFAULT_TIMEOUT, DEFAULT_ROLL_CHECK_INTERVAL
+from . import DEFAULT_SOCK_PATH, DEFAULT_TIMEOUT
 from .client import ProxyFile
 
 _level_names = {
@@ -28,7 +27,6 @@ class Logger:
         local_file=False,
         offlog_socket_path=DEFAULT_SOCK_PATH,
         offlog_timeout=DEFAULT_TIMEOUT,
-        min_roll_check_interval=DEFAULT_ROLL_CHECK_INTERVAL,
     ):
         """Logging object to log to file, stdout and stderr, with optional proxying of
         file writes via a offlog server.
@@ -46,11 +44,6 @@ class Logger:
         with the server (such as the initial file open, and flushing data at shutdown) will be
         subject to a communications timeout of `offlog_timeout` in milliseconds, default 5000.
 
-        `min_roll_check_interval` is the minimum time in milliseconds in between checks
-        for whether the file has vanished off disk, such as if the log file has been
-        rolled by an external log rotating program. If this is detected, the file is
-        closed and reopened.
-
         UTF-8 encoding is assumed throughout."""
 
         self.name = name
@@ -65,8 +58,6 @@ class Logger:
             [l for l in [file_level, stdout_level, stderr_level] if l is not None]
         )
         self.file = self._open()
-        self._last_roll_check = monotonic()
-        self.min_roll_check_interval = min_roll_check_interval
 
     def _open(self, block=True):
         if self.file_level is not None and self.filepath is not None:
@@ -80,24 +71,34 @@ class Logger:
                     block_open=block
                 )
 
-    def _roll_check(self):
-        # Check if the file has vanished on disk and if so, close and reopen it. This
-        # will block if the unix socket to the server is full, but will not block
-        # waiting for the server to confirm data was flushed on close, or waiting for
-        # the server to confirm the file was reopened. Thus as long as the server is not
-        # lagging so much that our unix socket buffer is full (which is like, 200kB on
-        # most systems), this should be non-blocking.
-        if self.file is not None:
-            now = monotonic()
-            if 1000 * (now - self._last_roll_check) > self.min_roll_check_interval:
-                self._last_roll_check = now
-                if not os.path.exists(self.filepath):
-                    # Close and reopen, blocking only if the unix socket to send data is
-                    # full - this should not normally happen as it's 200kB large on most
-                    # systems. If there's an error reopening the file, it will be raised
-                    # at next write attempt
-                    self.close(block_send=True, block_close=False)
-                    self.file = self._open(block=False)
+    def _check_rotated(self):
+        # Check if the file has been renamed/moved/deleted, and if so, close and reopen
+        # it. For a local file this is checked locally. For a non-local file, the server
+        # checks at regular intervals if the file has been rotated - every five seconds
+        # by default - so we may not handle a rotation until that long after it occured.
+        # Closing a non-local file on rotation will block if the send buffer of the unix
+        # socket to the server is full, but will not block waiting for the server to
+        # confirm data was flushed on close, or waiting for the server to confirm the
+        # file was reopened. Thus as long as the server is not lagging so much that our
+        # socket buffer is full (which is >100kB on most systems), handling rotation
+        # should be non-blocking.
+        if self.file is None:
+            return
+        if self.local_file:
+            try:
+                rotated = os.stat(self.file.fileno()).st_ino != os.stat(self.filepath).st_ino
+            except FileNotFoundError:
+                rotated = True
+        else:
+            rotated = self.file.check_rotated()
+
+        if rotated:
+            # Close and reopen, blocking only if the unix socket to send data is
+            # full - this should not normally happen as it's >100kB on most systems.
+            # If there's an error reopening the file, it will be raised at next
+            # write attempt
+            self.close(block_send=True, block_close=False)
+            self.file = self._open(block=False)
 
     def close(self, block_send=True, block_close=True):
         """Close the file. Possibly blocking. Idempotent.
@@ -143,7 +144,7 @@ class Logger:
     def log(self, level, msg, *args, exc_info=False):
         if level < self.minlevel:
             return
-        self._roll_check()
+        self._check_rotated()
         msg = self.format(level, msg, *args, exc_info=exc_info)
         if self.file is not None and level >= self.file_level:
             self.file.write(msg)

@@ -10,7 +10,7 @@ from . import DEFAULT_TIMEOUT, DEFAULT_SOCK_PATH
 BUFSIZE = 4096
 FILE_OK = b"OK"
 GOODBYE = b"BYE"
-
+ROTATED = b"ROTATED"
 
 def _make_exception(response):
     # Generate an exception object from a response from the server. Or return None if no
@@ -95,6 +95,7 @@ class ProxyFile:
         self._sendqueue = _ByteQueue()
         self._connect()
         self._open(filepath, block=block_open)
+        self._rotated = False
 
     def _connect(self):
         try:
@@ -140,28 +141,44 @@ class ProxyFile:
         # Check for errors now if block=True, otherwise error responses will be received
         # and raised later when client attempts to write
         if block:
-            self._check_errmsg_received()
+            response = self._recv_msg()
+            if response != FILE_OK:
+                self.sock.close()
+                raise _make_exception(response)
 
-    def _check_errmsg_received(self):
-        """Check if the server has sent us an error message and raise it if so"""
+    def check_rotated(self):
+        """Return whether the server has sent us a message indicating the underlying
+        file was moved/renamed/deleted"""
+        self._checkrecv()
+        return self._rotated
+
+    def _checkrecv(self, timeout=0):
+        """Check if the server has sent us any messages. If it has sent a notification
+        that the file was rotated, set self._rotated=True. If it's an error, raise it."""
         while self.poller.poll(0):
             # No possibility of getting a partial message (and therefore TimeoutError)
             # because all messages the server sends are smaller than PIPE_BUF and
             # therefore sent atomically
             msg = self._recv_msg(timeout=0)
-            if msg != FILE_OK: # indicates sucessful file open, ignore.
+            if msg == FILE_OK:
+                # indicates sucessful file open, not previously read due to nonblocking
+                # _open(). ignore.
+                continue
+            elif msg == ROTATED:
+                self._rotated = True
+            else:
+                # An error, raise it
                 self.sock.close()
                 raise _make_exception(msg) from None
 
     def _checksend(self, data):
-        """Send data and return number of bytes sent. If the server has sent us an error
-        message, raise it."""
-        self._check_errmsg_received()
+        """Send data and return number of bytes sent. If the server has closed the
+        socket and sent us an error message, raise it."""
         try:
             return self.sock.send(data)
         except BrokenPipeError:
-            self._check_errmsg_received()
-            raise # reraise if no error was raised by _check_errmsg_received()
+            self._checkrecv()
+            raise # reraise if no error was raised by _checkrecv()
         except ConnectionResetError:
             self.sock.close()
             raise
@@ -235,9 +252,13 @@ class ProxyFile:
                 self._retry_queued()
             self.sock.shutdown(socket.SHUT_WR)
             if block_close:
-                response = self._recv_msg()
-                if response != GOODBYE:
-                    raise _make_exception(response)
+                while True:
+                    response = self._recv_msg()
+                    if response in [FILE_OK, ROTATED]:
+                        # Not relevant, ignore
+                        continue
+                    elif response != GOODBYE:
+                        raise _make_exception(response)
         finally:
             self.sock.close()
 

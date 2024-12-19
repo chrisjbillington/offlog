@@ -2,6 +2,7 @@ import sys
 import os
 from pathlib import Path
 import socket
+import time
 import select
 import traceback
 import signal
@@ -9,7 +10,7 @@ import io
 import ctypes
 import ctypes.util
 
-from . import DEFAULT_SOCK_PATH, Logger
+from . import DEFAULT_SOCK_PATH, DEFAULT_ROTATE_CHECK_INTERVAL, Logger
 
 BUFSIZE = 4096
 PATH_MAX = os.pathconf('/', 'PC_PATH_MAX')
@@ -21,6 +22,7 @@ ERR_NABSPATH = b"ValueError: not an absolute path"
 ERR_SHUTDOWN = b"OSError: offlog server exited"
 FILE_OK = b"OK"
 GOODBYE = b"BYE"
+ROTATED = b"ROTATED"
 
 # Possible states a client session might be in after receiving data from it:
 CONNECTION_ACTIVE = 0
@@ -45,12 +47,27 @@ def _systemd_notify():
     libsystemd.sd_notify(0, b'READY=1')
 
 
+def _time_ms():
+    return time.monotonic_ns() // 1_000_000
+
+
 class FileHandler:
     def __init__(self, filepath, client_id):
         self.filepath = filepath
         self.client_id = client_id
         self.file = open(self.filepath, 'ab')
         logger.info("Client %d opened %s", self.client_id, self.filepath)
+        self.rotated = False
+
+    def check_rotated(self):
+        try:
+            if os.stat(self.file.fileno()).st_ino != os.stat(self.filepath).st_ino:
+                self.rotated = True
+        except FileNotFoundError:
+            self.rotated = True
+        if self.rotated:
+            logger.info("File rotation detected: %s", self.filepath)
+        return self.rotated
 
     def write(self, msg):
         self.file.write(msg)
@@ -99,6 +116,21 @@ class Session:
             return SERVER_TO_CLOSE_CONNECTION
         except (BrokenPipeError, ConnectionResetError):
             return CLIENT_CLOSED_CONNECTION
+
+    def check_rotated(self):
+        if self._shutting_down:
+            # Do nothing if shutting down
+            return CONNECTION_ACTIVE
+        if self.filehandler is None:
+            # Do nothing if we don't have an open file
+            return CONNECTION_ACTIVE
+        if self.filehandler.rotated:
+            # Do nothing if we've already told the client the file has been rotated
+            return CONNECTION_ACTIVE
+        if self.filehandler.check_rotated():
+            # Tell the client the file has been rotated:
+            return self.do_send(ROTATED) or CONNECTION_ACTIVE
+        return CONNECTION_ACTIVE
 
     def do_recv(self):
         # Read data from the client
@@ -168,13 +200,18 @@ class Session:
 
 class Server:
     def __init__(
-        self, sock_path=DEFAULT_SOCK_PATH, log_path=None, systemd_notify=False
+        self,
+        sock_path=DEFAULT_SOCK_PATH,
+        log_path=None,
+        systemd_notify=False,
+        rotate_check_interval=DEFAULT_ROTATE_CHECK_INTERVAL,
     ):
         # Create a logger for the server itself
         global logger
         logger = Logger(name='offlog', filepath=log_path, local_file=True)
 
         self.systemd_notify = systemd_notify
+        self.rotate_check_interval = rotate_check_interval
 
         self.sock_path = Path(sock_path)
         self.sock_path.unlink(missing_ok=True)
@@ -191,6 +228,9 @@ class Server:
 
         # Mapping of socket file descriptors to Session objects for connected clients
         self.clients = {}
+
+        # When to next check whether files have been rotated:
+        self.t_next_rotate_check_ms = _time_ms() + self.rotate_check_interval
 
     def handle_client_connect(self):
         client_sock, _ = self.listen_sock.accept()
@@ -219,21 +259,29 @@ class Server:
             _systemd_notify()
 
         while True:
-            events = self.poller.poll()
-            for fd, _ in events:
-                if fd == self.listen_sock.fileno():
-                    self.handle_client_connect()
-                elif fd == self.selfpipe_reader:
-                    # Shutting down. We will process remaining data before exiting the
-                    # mainloop.
-                    logger.info("Received signal, shutting down")
-                    self.shutdown()
-                else:
-                    # Data from a client:
-                    client = self.clients[fd]
-                    status = client.do_recv()
+            timeout = max(0, self.t_next_rotate_check_ms - _time_ms())
+            events = self.poller.poll(timeout)
+            if events:
+                for fd, _ in events:
+                    if fd == self.listen_sock.fileno():
+                        self.handle_client_connect()
+                    elif fd == self.selfpipe_reader:
+                        # Shutting down. We will process remaining data before exiting
+                        # the mainloop.
+                        logger.info("Received signal, shutting down")
+                        self.shutdown()
+                    else:
+                        # Data from a client:
+                        client = self.clients[fd]
+                        status = client.do_recv()
+                        if status != CONNECTION_ACTIVE:
+                            self.handle_client_disconnect(client, status)
+            else:
+                for client in self.clients.values():
+                    status = client.check_rotated()
                     if status != CONNECTION_ACTIVE:
                         self.handle_client_disconnect(client, status)
+                self.t_next_rotate_check_ms = _time_ms() + self.rotate_check_interval
             if self.listen_sock.fileno() == -1 and not self.clients:
                 # Finished shutting down
                 logger.info("Exit")
