@@ -254,10 +254,9 @@ class ProxyFile:
             if block_close:
                 while True:
                     response = self._recv_msg()
-                    if response in [FILE_OK, ROTATED]:
-                        # Not relevant, ignore
-                        continue
-                    elif response != GOODBYE:
+                    if response == GOODBYE:
+                        return
+                    elif response not in [FILE_OK, ROTATED]:
                         raise _make_exception(response)
         finally:
             self.sock.close()
